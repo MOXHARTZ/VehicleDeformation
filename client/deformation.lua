@@ -1,18 +1,31 @@
 
--- set to true to see debug messages
-local DEBUG = true
-
--- iterations for damage application
-local MAX_DEFORM_ITERATIONS <const> = 50
-
 -- the minimum damage value at a deformation point before being registered as actual damage
 local DEFORMATION_DAMAGE_THRESHOLD <const> = 0.05
 
 -- max difference for angle to be considered to steep (0.0-1.0)
 local ANGLE_THRESHOLD <const> = 0.5
 
-local INITIAL_DAMAGE <const> = 50.0
-local DAMAGE_INCREMENTS <const> = 5.0
+-- iterations for damage application
+local MAX_PASSES <const> = 12
+local PASS_DELAY_MS <const> = 150
+
+local START_DELTA <const> = 0.3
+local DELTA_STEP <const> = 0.15
+local MAX_DELTA <const> = 1.2
+
+local HEALTH_DAMAGE <const> = 1.0
+
+local POINTS_PER_FRAME <const> = 12
+
+local APPLY_DISTANCE <const> = 150.0
+local MAX_CONCURRENT <const> = 4
+
+local COLLISION_TIMEOUT <const> = 5000
+
+local APPLY_GRACE_MS <const> = 1500
+
+local applying = {}
+local activeApplies = 0
 
 -- cache for deformation offsets
 local deformationOffsets = {}
@@ -39,6 +52,47 @@ function GetVehicleDeformation(vehicle)
 	return deformationPoints
 end
 
+local function applyPasses(vehicle, deformationPoints, superseded)
+	local mass = GetVehicleHandlingFloat(vehicle, "CHandlingData", "fMass")
+	local deformMult = GetVehicleHandlingFloat(vehicle, "CHandlingData", "fDeformationDamageMult")
+	if (mass <= 0.0 or deformMult <= 0.00001) then
+		LogDebug("\"%s\" cannot be deformed (fDeformationDamageMult %.3f).", GetVehicleNumberPlateText(vehicle), deformMult)
+		return 0
+	end
+	local impulsePerDelta = mass / deformMult
+
+	local delta = {}
+	local passes = 0
+	local pending = true
+	while (pending and passes < MAX_PASSES) do
+		if (superseded()) then return passes end
+
+		pending = false
+		local calls = 0
+
+		for i, def in ipairs(deformationPoints) do
+			local offset = vector3(def[1].x, def[1].y, def[1].z)
+			local current = ClampVectorAlongAxis(GetVehicleDeformationAtPos(vehicle, offset.x, offset.y, offset.z), -offset)
+			if (#current < #vector3(def[2].x, def[2].y, def[2].z) and (delta[i] or 0.0) < MAX_DELTA) then
+				delta[i] = delta[i] and math.min(delta[i] + DELTA_STEP, MAX_DELTA) or START_DELTA
+				SetVehicleDamage(vehicle, offset.x, offset.y, offset.z, HEALTH_DAMAGE, delta[i] * impulsePerDelta, true)
+				pending = true
+
+				calls = calls + 1
+				if (calls % POINTS_PER_FRAME == 0) then
+					Wait(0)
+					if (superseded()) then return passes end
+				end
+			end
+		end
+
+		passes = passes + 1
+		Wait(PASS_DELAY_MS)
+	end
+
+	return passes
+end
+
 -- sets deformation on a vehicle
 function SetVehicleDeformation(vehicle, deformationPoints, callback)
 	assert(vehicle ~= nil and DoesEntityExist(vehicle), "Parameter \"vehicle\" must be a valid vehicle entity!")
@@ -53,59 +107,87 @@ function SetVehicleDeformation(vehicle, deformationPoints, callback)
 		return
 	end
 
+	local token = {}
+	applying[vehicle] = token
+
 	CreateThread(function()
-		local deform = true
-		local iterations = 0
-		while (deform and iterations < MAX_DEFORM_ITERATIONS) do
-			if (not DoesEntityExist(vehicle)) then
-				LogDebug("Vehicle got deleted mid-deformation.")
-				return
-			end
-
-			deform = false
-
-			for i, def in ipairs(deformationPoints) do
-				local currDef = GetVehicleDeformationAtPos(vehicle, def[1].x, def[1].y, def[1].z)
-				local clampedDef = ClampVectorAlongAxis(currDef, -vector3(def[1].x, def[1].y, def[1].z))
-				if (#clampedDef < #vector(def[2].x, def[2].y, def[2].z)) then
-					-- damage/radius increase method - seems to work best for most vehicles
-					if (def[3] == nil) then
-						def[3] = INITIAL_DAMAGE
-					else
-						def[3] = def[3] + DAMAGE_INCREMENTS
-					end
-					SetVehicleDamage(
-						vehicle, 
-						def[1].x, def[1].y, def[1].z, 
-						def[3], -- damage
-						def[3], -- radius
-						true
-					)
-
-					deform = true
-
-					Wait(0)
-				end
-			end
-
-			iterations = iterations + 1
-
-			Wait(0)
+		local function superseded()
+			return not DoesEntityExist(vehicle) or applying[vehicle] ~= token
 		end
 
-		if (not IsVehicleBlacklisted(vehicle)) then
+		local function release()
+			if (applying[vehicle] == token) then
+				applying[vehicle] = nil
+			end
+		end
+
+		while (not superseded() and #(GetEntityCoords(PlayerPedId()) - GetEntityCoords(vehicle)) > APPLY_DISTANCE) do
+			Wait(1000)
+		end
+
+		while (not superseded() and activeApplies >= MAX_CONCURRENT) do
+			Wait(100)
+		end
+		if (superseded()) then return release() end
+		activeApplies = activeApplies + 1
+
+		local deadline = GetGameTimer() + COLLISION_TIMEOUT
+		while (not superseded() and not HasCollisionLoadedAroundEntity(vehicle) and GetGameTimer() < deadline) do
+			Wait(100)
+		end
+
+		local passes = 0
+		if (not superseded()) then
+			local engineHealth = GetVehicleEngineHealth(vehicle)
+			local bodyHealth = GetVehicleBodyHealth(vehicle)
+			local tankHealth = GetVehiclePetrolTankHealth(vehicle)
+
+			local froze = false
+			if (not IsEntityPositionFrozen(vehicle)
+				and GetPedInVehicleSeat(vehicle, -1) == 0
+				and GetEntitySpeed(vehicle) < 1.0) then
+				FreezeEntityPosition(vehicle, true)
+				froze = true
+			end
+
+			passes = applyPasses(vehicle, deformationPoints, superseded)
+
+			if (DoesEntityExist(vehicle)) then
+				SetVehicleEngineHealth(vehicle, math.max(GetVehicleEngineHealth(vehicle), engineHealth))
+				SetVehicleBodyHealth(vehicle, math.max(GetVehicleBodyHealth(vehicle), bodyHealth))
+				SetVehiclePetrolTankHealth(vehicle, math.max(GetVehiclePetrolTankHealth(vehicle), tankHealth))
+
+				if (froze) then
+					FreezeEntityPosition(vehicle, false)
+				end
+			end
+		end
+
+		activeApplies = activeApplies - 1
+
+		if (superseded()) then return release() end
+
+		if (NetworkGetEntityOwner(vehicle) == PlayerId() and not IsVehicleBlacklisted(vehicle)) then
 			local state = Entity(vehicle).state
 			if (state.deformation == nil) then
+				MarkDeformationApplied(vehicle, deformationPoints)
 				state:set("deformation", deformationPoints, true)
 			end
 		end
 
-		LogDebug("Applying deformation finished for \"%s\" in %s iterations.", GetVehicleNumberPlateText(vehicle), iterations)
+		LogDebug("Applying deformation finished for \"%s\" in %s passes.", GetVehicleNumberPlateText(vehicle), passes)
+
+		Wait(APPLY_GRACE_MS)
+		release()
 
 		if (callback) then
 			callback()
 		end
 	end)
+end
+
+function IsApplyingDeformation(vehicle)
+	return applying[vehicle] ~= nil
 end
 
 -- returns true if deformation is worse
@@ -238,12 +320,10 @@ function Round(value, numDecimals)
 end
 
 function LogDebug(text, ...)
-	if (DEBUG) then
+	if (debugMode) then
 		print(("^0[DEBUG] %s^0"):format(text):format(...))
 	end
 end
-
-
 
 exports("GetVehicleDeformation", GetVehicleDeformation)
 exports("SetVehicleDeformation", SetVehicleDeformation)

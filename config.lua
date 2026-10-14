@@ -1,4 +1,7 @@
 
+-- set to true to see debug messages
+debugMode = false
+
 -- blacklist vehicle types from automatic sync (automobile, bike, boat, heli, plane, submarine, trailer, train)
 typeBlacklist = {
 	"bike",

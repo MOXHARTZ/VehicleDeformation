@@ -31,20 +31,35 @@ function IsVehicleBlacklisted(vehicle)
 	return false
 end
 
-local function ApplyDeformation(vehicle, deformation)
-	if (not DoesEntityExist(vehicle)) then
-		local endTime = GetGameTimer() + 5000
-		while (not DoesEntityExist(vehicle) and GetGameTimer() < endTime) do
-			Wait(0)
-		end
+local appliedFingerprint = {}
 
-		if (not DoesEntityExist(vehicle)) then
-			return
-		end
+local function fingerprint(points)
+	if (type(points) ~= "table" or #points == 0) then return "" end
+	local parts = {}
+	for i, def in ipairs(points) do
+		parts[i] = ("%.2f,%.2f,%.2f:%.2f,%.2f,%.2f"):format(def[1].x, def[1].y, def[1].z, def[2].x, def[2].y, def[2].z)
 	end
-	if (not IsEntityAVehicle(vehicle)) then return end
+	return table.concat(parts, ";")
+end
 
-	if (deformation and #deformation > 0) then
+function MarkDeformationApplied(vehicle, points)
+	appliedFingerprint[vehicle] = fingerprint(points)
+end
+
+local function ApplyDeformation(bagName, deformation)
+	local vehicle = GetEntityFromStateBagName(bagName)
+	local endTime = GetGameTimer() + 5000
+	while (not DoesEntityExist(vehicle) and GetGameTimer() < endTime) do
+		Wait(100)
+		vehicle = GetEntityFromStateBagName(bagName)
+	end
+	if (not DoesEntityExist(vehicle) or not IsEntityAVehicle(vehicle)) then return end
+
+	local print = fingerprint(deformation)
+	if (appliedFingerprint[vehicle] == print) then return end
+	appliedFingerprint[vehicle] = print
+
+	if (print ~= "") then
 		SetVehicleDeformation(vehicle, deformation)
 	else
 		SetVehicleDeformationFixed(vehicle)
@@ -61,24 +76,31 @@ local function HandleDeformationUpdate(vehicle)
 	damageUpdate[vehicle] = GetGameTimer() + 1000
 
 	while (damageUpdate[vehicle] > GetGameTimer()) do
-		Wait(0)
+		Wait(100)
 	end
 
 	damageUpdate[vehicle] = nil
 
 	if (not DoesEntityExist(vehicle) or NetworkGetEntityOwner(vehicle) ~= PlayerId()) then return end
+	if (IsApplyingDeformation(vehicle)) then return end
 
 	local deformation = GetVehicleDeformation(vehicle)
-	if (deformation and #deformation > 0) then
-		Entity(vehicle).state:set("deformation", deformation, true)
-	end
+	if (not deformation or #deformation == 0) then return end
+
+	local print = fingerprint(deformation)
+	if (appliedFingerprint[vehicle] == print) then return end
+	appliedFingerprint[vehicle] = print
+
+	Entity(vehicle).state:set("deformation", deformation, true)
 end
 
 -- state bag handler to apply any deformation
 AddStateBagChangeHandler("deformation", nil, function(bagName, key, value, _unused, replicated)
 	if (bagName:find("entity") == nil) then return end
 
-	ApplyDeformation(GetEntityFromStateBagName(bagName), value)
+	CreateThread(function()
+		ApplyDeformation(bagName, value)
+	end)
 end)
 
 -- update state bag on taking damage
@@ -88,7 +110,22 @@ AddEventHandler("gameEventTriggered", function (name, args)
 	local entity = args[1]
 	if (not IsEntityAVehicle(entity) or IsVehicleBlacklisted(entity)) then return end
 
-	HandleDeformationUpdate(entity)
+	if (IsApplyingDeformation(entity)) then return end
+
+	CreateThread(function()
+		HandleDeformationUpdate(entity)
+	end)
+end)
+
+CreateThread(function()
+	while (true) do
+		Wait(60000)
+		for vehicle in pairs(appliedFingerprint) do
+			if (not DoesEntityExist(vehicle)) then
+				appliedFingerprint[vehicle] = nil
+			end
+		end
+	end
 end)
 
 -- fix deformation on vehicle
